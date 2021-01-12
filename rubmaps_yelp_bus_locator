@@ -1,0 +1,76 @@
+#Converts tweets to tidy text format:
+library(tidyverse)#so we can use the pipe operator, select, function, summarize, filter...
+library(tidytext)
+library(tm)
+library(openintro)
+
+#Read the csv file
+yelpdata <- read_csv("C:\\Users\\Angel\\datasets\\yelp_reviews_massage_categories.csv")
+rubmapsdata<- read_csv("C:\\Users\\Angel\\RM_LOCATIONS_EDITED.csv")
+
+#I need to isolate a dataset that has matching addresses in both datasets
+#Since parlors change names and ownership but stay in the same location
+# means that I will be matching business by state and address
+
+#Pare the sets down to cut lookup times by cutting out those states not included in both sets
+#First check which states are present in rubmaps
+unique(rubmapsdata$STATE, incomparables = FALSE)
+unique(yelpdata$state, incomparables = FALSE)
+
+#Then filter by those states found in both sets. The yelpdataset includes 2 Canadian provinces, so we'll exclude those
+yelpdata_reduced <- yelpdata %>% filter(state=="NV"|state=="OH"|state=="NC"|state=="AZ"|state=="WI"|state=="PA"|state=="SC"|state=="IL"|state=="UT"|state=="NY"|state=="CA")
+rubmapsdata_reduced <- rubmapsdata %>% filter(STATE=="NEVADA"|STATE=="OHIO"|STATE=="NORTH CAROLINA"|STATE=="ARIZONA"|STATE=="WISCONSIN"|STATE=="PENNSYLVANIA"|STATE=="SOUTH CAROLINA"|STATE=="ILLINOIS"|STATE=="UTAH"|STATE=="NEW YORK"|STATE=="CALIFORNIA")
+
+#Clean the address column so that a match might occur by changing column to lowercase and removing punctuation.
+yelpdata_reduced$address <- tolower(yelpdata_reduced$address)
+yelpdata_reduced$name <- tolower(yelpdata_reduced$name)
+rubmapsdata_reduced$ORIGINAL_ADDR <- tolower(rubmapsdata_reduced$ORIGINAL_ADDR)
+rubmapsdata_reduced$LOCATION_NAME <- tolower(rubmapsdata_reduced$LOCATION_NAME)
+#Lowercase all the text for later analysis
+yelpdata_reduced$text <- tolower(yelpdata_reduced$text)
+
+
+yelpdata_reduced$address <- removePunctuation(yelpdata_reduced$address, preserve_intra_word_contractions = FALSE, preserve_intra_word_dashes = FALSE, ucp = FALSE)
+yelpdata_reduced$name <- removePunctuation(yelpdata_reduced$name, preserve_intra_word_contractions = FALSE, preserve_intra_word_dashes = FALSE, ucp = FALSE)
+
+rubmapsdata_reduced$LOCATION_NAME <- removePunctuation(rubmapsdata_reduced$LOCATION_NAME, preserve_intra_word_contractions = FALSE, preserve_intra_word_dashes = FALSE, ucp = FALSE)
+rubmapsdata_reduced$ORIGINAL_ADDR <- removePunctuation(rubmapsdata_reduced$ORIGINAL_ADDR, preserve_intra_word_contractions = FALSE, preserve_intra_word_dashes = FALSE, ucp = FALSE)
+#Convert yelpdata states from abbr to full state name then make both set's state column lowercase
+yelpdata_reduced$state <- abbr2state(yelpdata_reduced$state)
+yelpdata_reduced$state <- tolower(yelpdata_reduced$state)
+rubmapsdata_reduced$STATE <- tolower(rubmapsdata_reduced$STATE)
+
+#Make column names match in both datasets to be able to perform full_join
+rubmapsdata_reduced <- rename(rubmapsdata_reduced, state = STATE, address = ORIGINAL_ADDR, postal_code = ZIP, name = LOCATION_NAME  )
+
+test_df <- full_join(yelpdata_reduced, rubmapsdata_reduced, by = c("state" = "state", "address" = "address"), copy = FALSE)
+name_match_df <- full_join(yelpdata_reduced, rubmapsdata_reduced, by = c("state" = "state", "address" = "address", "name" = "name"), copy = FALSE)
+
+#NON IBMS
+non_ibm_df <- anti_join(yelpdata_reduced, rubmapsdata_reduced, by = c("state" = "state", "address" = "address"), copy = FALSE)
+
+
+#Drop rows with n/a value for x1
+test_df <- na.omit(test_df, X1)
+name_match_df <- na.omit(name_match_df, X1)
+
+#convert variable review_stars from double to integer for sorting
+test_df$review_stars <- as.integer(test_df$review_stars)
+
+#Need to omit rows with categories that have nail, tattoo, barbers, hair, piercing, and eyebrow in them
+test_df <- test_df %>% filter(!str_detect(categories, "Nail|Tattoo|Barbers|Hair|Piercing|Eyebrow|Shopping|Cosmetics|Supply|Tan"))
+name_match_df <- name_match_df %>% filter(!str_detect(categories, "Nail|Tattoo|Barbers|Hair|Piercing|Eyebrow|Shopping|Cosmetics|Supply|Tan"))
+non_ibm_df <- non_ibm_df %>% filter(!str_detect(categories, "Nail|Tattoo|Barbers|Hair|Piercing|Eyebrow|Shopping|Cosmetics|Supply|Tan|Food|Coffee & Tea|Eyelash Service|Life Coach|Dentists|Colonics|Makeup|Doctors|Chiropractors|Active|Fitness"))
+
+#Filter for words that indicate trafficking
+m <- test_df %>% filter(str_detect(text, "HE"))
+ibm_df <- test_df %>% filter(str_detect(text, "prostitute|shady|table shower|dark|no prices|cameras|illegal|don't speak|happy ending|release"))
+m_df <- name_match_df %>% filter(str_detect(text, "prostitute|shady|table shower|dark|no prices|cameras|illegal|don't speak|happy ending|release"))
+#non_ibm_df_sus <- non_ibm_df %>% filter(str_detect(text, "prostitute|shady|table shower|dark|no prices|cameras|illegal|don't speak|happy ending|release"))
+
+
+write.csv(test_df, "C:\\Users\\datasets\\rub_location_match_yelp.csv")
+write.csv(ibm_df, "C:\\Users\\Angel\\datasets\\rub_location_and_keyword_match_yelp.csv")
+write.csv(name_match_df, "C:\\Users\\Angel\\datasets\\rub_and_name_match_yelp.csv")
+write.csv(non_ibm_df, "C:\\Users\\Angel\\datasets\\non_imb_yelp.csv")
+
