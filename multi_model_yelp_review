@@ -1,0 +1,1096 @@
+library(tidyverse)
+library(tidytext)
+library(caret)
+library(tm)
+library(knitr)
+library(kableExtra)
+library(wordcloud)
+
+#___Credit To Emil Hvitfeldt's tutorial "Binary text classificatoin with Tidytext and caret"
+#___ https://www.hvitfeldt.me/blog/binary-text-classification-with-tidytext-and-caret/
+
+set.seed(1234)
+theme_set(theme_minimal())
+
+#Read in datasets
+test_df <-read_csv("C:\\Users\\Angel\\datasets\\rub_and_name_match_yelp.csv")
+non_imb_df <- read_csv("C:\\Users\\Angel\\datasets\\non_imb_yelp.csv")
+
+#_________________________FORMAT_THE_DATA_FOR_ANALYSIS_____________________________________________________________________
+#Remove extra columns of test_df 
+test_df <- test_df[, 1:17]
+#Assign imb and mb labels
+test_df$label <- TRUE
+non_imb_df$label <- FALSE
+#Change variable X1 to ID
+test_df <- rename(test_df, id=X1)
+non_imb_df <- rename(non_imb_df, id=X1)
+#Add topic code, a numeric of the label 1 is true, it is an imb, 0 is false, it is not an imb
+test_df$topic_code <- 1
+non_imb_df$topic_code <-0
+#Take a random sample of 4848 rows from the non_imb_df to make the labels even and remove columns that are not part of this analysis
+test_df <- test_df %>% select(id, text, label, topic_code)
+non_imb_df <- non_imb_df %>% select(id, text, label, topic_code)
+non_imb_df <- sample_n(non_imb_df, nrow(test_df))
+#Bind the two tests together as our training set
+train_set <- rbind(test_df, non_imb_df)
+train_set <- as_tibble(train_set)
+
+data_clean <- train_set
+#Convert label to a factor for ML
+data_clean$label <- as.factor(data_clean$label)
+
+
+#___________Looking at unigrams and bigrams__________________________________________________________________________________
+data_clean %>%
+  ggplot(aes(label)) +
+  geom_bar()
+
+#map_df returns a dataframe
+#This dataframe is 2 columns with stop words removed.
+data_counts <- map_df(1:2,
+                      ~ unnest_tokens(data_clean, word, text, 
+                                      token = "ngrams", n = .x)) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(id, word, sort = TRUE)
+
+
+#_______________________________________________________________________________________________________________________
+words_10 <- data_counts %>%
+  group_by(word) %>%
+  summarise(n = n()) %>% 
+  filter(n >= 10) %>%
+  select(word)
+  
+#_______________________________________________________________________________________________________________________
+#Right join to a dataframe before 
+#calculating the tf-idf and cast it to
+#a document term matrix
+#(Right join returns rows from y
+#and all col's from x and y)  
+data_dtm <- data_counts %>%
+  right_join(words_10, by = "word") %>%
+  bind_tf_idf(word, id, n) %>%
+  cast_dtm(id, word, tf_idf)
+
+  #_____________________________________________________________________
+#meta is used to store the observations from the original dataframe 
+#that may have been lost in the previous reduction steps.
+meta <- tibble(id = as.numeric(dimnames(data_dtm)[[1]])) %>%
+    left_join(data_clean[!duplicated(data_clean$id), ], by = "id")
+
+#_______________________________________________________________________
+set.seed(1234)
+trainIndex <- createDataPartition(meta$label, p = 0.8, list = FALSE, times = 1)
+
+#______________________________________________________________________
+data_df_train <- data_dtm[trainIndex, ] %>% as.matrix() %>% as.data.frame()
+data_df_test <- data_dtm[-trainIndex, ] %>% as.matrix() %>% as.data.frame()
+
+response_train <- meta$label[trainIndex]
+
+#_______________________________________________________________________
+data_clean %>%
+  anti_join(meta, by = "id") %>%
+  head(25) %>%
+  pull(text)
+
+#_______________________________________________________________________
+#trctrl <- trainControl(method = "none")
+trctrl <-trainControl(method = "repeatedcv",
+                      number = 3,
+                      repeats = 3,
+                      search = "grid")
+#__________________SVM_________________________________________________________________________________________________
+
+svm_mod <- train(x = data_df_train,
+                 y = as.factor(response_train),
+                 method = "svmLinearWeights2",
+                 trControl = trctrl,
+                 tuneGrid = data.frame(cost = 1, 
+                                       Loss = 0, 
+                                       weight = 1))
+#svm_mod <- train(x = data_df_train,
+#                 y = as.factor(response_train),
+#                 method = "lssvmRadial",
+#                 trControl = trctrl,
+#                 tuneGrid = data.frame(sigma = 0.01, tau=0))
+
+svm_pred <- predict(svm_mod,
+                    newdata = data_df_test)
+
+svm_cm <- confusionMatrix(svm_pred, meta[-trainIndex, ]$label, positive='TRUE')
+
+svm_cm
+
+
+#________________NAIVE-BAYES__________________________________________________________________________________________
+
+nb_mod <- train(x = data_df_train,
+                y = as.factor(response_train),
+                method = "naive_bayes",
+                trControl = trctrl,
+                tuneGrid = data.frame(laplace = 0,
+                                      usekernel = FALSE,
+                                      adjust = FALSE))
+
+nb_pred <- predict(nb_mod,
+                   newdata = data_df_test)
+
+nb_cm <- confusionMatrix(nb_pred, meta[-trainIndex, ]$label, positive='TRUE')
+nb_cm
+
+#______________________RANDOM_FOREST_____________________________________________________________________________________
+rf_mod <- train(x = data_df_train, 
+                y = as.factor(response_train), 
+                method = "ranger",
+                trControl = trctrl,
+                tuneGrid = data.frame(mtry = floor(sqrt(dim(data_df_train)[2])),
+                                      splitrule = "gini",
+                                      min.node.size = 1))
+
+rf_pred <- predict(rf_mod,
+                   newdata = data_df_test)
+
+rf_cm <- confusionMatrix(rf_pred, meta[-trainIndex, ]$label, positive='TRUE')
+rf_cm
+
+#___________________NNET____________________________________________________________________________________________________
+
+nnet_mod <- train(x = data_df_train,
+                  y = as.factor(response_train),
+                  method = "nnet",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(size = 1,
+#                                        decay = 5e-4),
+                                         decay = 0.01),
+                  MaxNWts = 5000)
+
+
+nnet_pred <- predict(nnet_mod,
+                     newdata = data_df_test)
+
+nnet_cm <- confusionMatrix(nnet_pred, meta[-trainIndex, ]$label, positive='TRUE')
+nnet_cm
+
+#__________________COMPARING_MODELS_ACCURACY_______________________________________________________________________________________
+
+mod_results <- rbind(
+  svm_cm$overall, 
+  nb_cm$overall,
+  rf_cm$overall,
+  nnet_cm$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+mod_results %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_point() +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results$AccuracyNull[1],
+             color = "red")
+
+mod_bar_results <- mod_results %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_bar(stat="identity", fill = "#C1E4A5", color="#9EB953") +
+  xlab("Model") + ylab("Acc.") +
+  #geom_text(aes(label=Accuracy), vjust=1.6, color="white", size=3.5)+
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results$AccuracyNull[1],
+             color = "red")
+
+#__________________COMPARING_MODELS_F-SCORES,_PRECISION,_AND_RECALL_________________________________________________________
+
+mod_results_byClass <- rbind(
+  svm_cm$byClass, 
+  nb_cm$byClass,
+  rf_cm$byClass,
+  nnet_cm$byClass
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+#___F1_SCORES____________________________________________________________________________________________________________
+mod_results_byClass %>%
+  ggplot(aes(model, F1)) +
+  geom_point() +
+  ylim(0, 1)
+
+mod_bar_results_F1 <- mod_results_byClass %>%
+  ggplot(aes(model, F1)) +
+  geom_bar(stat="identity", fill = "#abd7eb", color="#99badd") +
+  xlab("Model") + ylab("F1") +
+  #geom_text(aes(label=F1), vjust=1.6, color="white", size=3.5)+
+  ylim(0, 1)
+
+#___PRECISION_SCORES____________________________________________________________________________________________________________
+mod_results_byClass %>%
+  ggplot(aes(model, `Pos Pred Value`)) +
+  geom_point() +
+  ylim(0, 1)
+
+mod_bar_results_precision <- mod_results_byClass %>%
+  ggplot(aes(model, `Pos Pred Value`)) +
+  geom_bar(stat="identity", fill = "#B19CD9", color="#AF64B5") +
+  xlab("Model") + ylab("Prec.") +
+  ylim(0, 1)
+
+#___Recall_SCORES____________________________________________________________________________________________________________
+mod_bar_results_Recall <- mod_results_byClass %>%
+  ggplot(aes(model, Recall)) +
+  geom_bar(stat="identity", fill = "#efcc90", color="#d4a537") +
+  xlab("Model") + ylab("Recall") +
+  ylim(0, 1)
+
+
+#_________________TUNING_HYPERPARAMETERS_______________________________________________________________________________________________________________
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 3,
+                           repeats = 3,
+                           search = "grid")
+
+svm_mod <- train(x = data_df_train,
+                 y = as.factor(response_train),
+                 method = "svmLinearWeights2",
+                 trControl = fitControl,
+                 tuneGrid = data.frame(cost = 0.01, 
+                                       Loss = 0, 
+                                       weight = seq(0.5, 1.5, 0.1)))
+
+#Calculate F-Scores and include bar graph for each compared to each other
+#Sensitivity is also called recall
+#Pos Pred value is also called precision
+plot(svm_mod)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#______PERFORM ANALYSIS USING SPARCITY REMOVED DTM's__________________________________________________________________
+#___ Test_Remove_Sparcity_____________________________________________________________________________________________
+#0. No sparsity
+no_sparse_data_dtm <-data_dtm
+#1. Yields Sparcity = 97%
+sparse_data_dtm_99 <- removeSparseTerms(data_dtm, sparse = .99)
+#2. Yields Sparcity = 95%
+sparse_data_dtm_98 <- removeSparseTerms(data_dtm, sparse = .98)
+#3. Yields Sparcity = 94%
+sparse_data_dtm_97 <- removeSparseTerms(data_dtm, sparse = .97)
+
+
+#You will generate the metrics below using the sparcity removed matrices above
+#________________________________________________________________________________________
+#########################################################################################
+#________________________________________________________________________________________
+#_______________________NO SPARSE DATA 0 0.99% SPARCITY REMOVED_____________________________
+#________________________________________________________________________________________
+meta_0 <- tibble(id = as.numeric(dimnames(no_sparse_data_dtm)[[1]])) %>%
+  left_join(data_clean[!duplicated(data_clean$id), ], by = "id")
+
+#_______________________________________________________________________
+set.seed(1234)
+trainIndex_0 <- createDataPartition(meta_0$label, p = 0.8, list = FALSE, times = 1)
+
+#______________________________________________________________________
+data_df_train_0 <- sparse_data_dtm_99[trainIndex_0, ] %>% as.matrix() %>% as.data.frame()
+data_df_test_0 <- sparse_data_dtm_99[-trainIndex_0, ] %>% as.matrix() %>% as.data.frame()
+
+response_train_0 <- meta_1$label[trainIndex_0]
+
+#_______________________________________________________________________
+data_clean %>%
+  anti_join(meta_0, by = "id") %>%
+  head(25) %>%
+  pull(text)
+
+#_______________________________________________________________________
+trctrl <- trainControl(method = "repeatedcv",
+                       number = 3,
+                       repeats = 3,
+                       search = "grid")
+
+#__________________SVM_________________________________________________________________________________________________
+
+svm_mod_0 <- train(x = data_df_train_0,
+                   y = as.factor(response_train_0),
+                   method = "svmLinearWeights2",
+                   trControl = trctrl,
+                   tuneGrid = data.frame(cost = 1, 
+                                         Loss = 0, 
+                                         weight = 1))
+
+
+svm_pred_0 <- predict(svm_mod_0,
+                      newdata = data_df_test_0)
+
+svm_cm_0 <- confusionMatrix(svm_pred_0, meta_0[-trainIndex_0, ]$label, positive='TRUE')
+
+svm_cm_0
+
+#________________NAIVE-BAYES__________________________________________________________________________________________
+
+nb_mod_0 <- train(x = data_df_train_0,
+                  y = as.factor(response_train_0),
+                  method = "naive_bayes",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(laplace = 0,
+                                        usekernel = FALSE,
+                                        adjust = FALSE))
+
+nb_pred_0 <- predict(nb_mod_0,
+                     newdata = data_df_test_0)
+
+nb_cm_0 <- confusionMatrix(nb_pred_0, meta_0[-trainIndex_0, ]$label, positive='TRUE')
+nb_cm_0
+
+#______________________RANDOM_FOREST_____________________________________________________________________________________
+rf_mod_0 <- train(x = data_df_train_0, 
+                  y = as.factor(response_train_0), 
+                  method = "ranger",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(mtry = floor(sqrt(dim(data_df_train_0)[2])),
+                                        splitrule = "gini",
+                                        min.node.size = 1))
+
+rf_pred_0 <- predict(rf_mod_0,
+                     newdata = data_df_test_0)
+
+rf_cm_0 <- confusionMatrix(rf_pred_0, meta_0[-trainIndex_0, ]$label, positive='TRUE')
+rf_cm_0
+
+#___________________NNET____________________________________________________________________________________________________
+
+nnet_mod_0 <- train(x = data_df_train_0,
+                    y = as.factor(response_train_0),
+                    method = "nnet",
+                    trControl = trctrl,
+                    tuneGrid = data.frame(size = 1,
+                                          decay = 0.01),
+                    MaxNWts = 5000)
+
+nnet_pred_0 <- predict(nnet_mod_0,
+                       newdata = data_df_test_0)
+
+nnet_cm_0 <- confusionMatrix(nnet_pred_0, meta_0[-trainIndex_0, ]$label, positive='TRUE')
+nnet_cm_0
+
+#__________________COMPARING_MODELS_ACCURACY_______________________________________________________________________________________
+
+mod_results_0 <- rbind(
+  svm_cm_0$overall, 
+  nb_cm_0$overall,
+  rf_cm_0$overall,
+  nnet_cm_0$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+mod_results_0 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_point() +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_0$AccuracyNull[1],
+             color = "red")
+
+mod_bar_results_0 <- mod_results_0 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_bar(stat="identity", fill = "#C1E4A5", color="#9EB953") +
+  xlab("Model") + ylab("Acc.") +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_0$AccuracyNull[1],
+             color = "red")
+
+#__________________COMPARING_MODELS_F-SCORES,_PRECISION,_AND_RECALL_________________________________________________________
+
+mod_results_byClass_0 <- rbind(
+  svm_cm_0$byClass, 
+  nb_cm_0$byClass,
+  rf_cm_0$byClass,
+  nnet_cm_0$byClass
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+#___F1_SCORES____________________________________________________________________________________________________________
+mod_bar_results_F1_0 <- mod_results_byClass_0 %>%
+  ggplot(aes(model, F1)) +
+  geom_bar(stat="identity", fill = "#abd7eb", color="#99badd") +
+  ggtitle("No Spars. Rm") +
+  xlab("Model") + ylab("F1") +
+  #geom_text(aes(label=F1), vjust=1.6, color="white", size=3.5)+
+  ylim(0, 1)
+
+#___PRECISION_SCORES____________________________________________________________________________________________________________
+mod_bar_results_precision_0 <- mod_results_byClass_0 %>%
+  ggplot(aes(model, `Pos Pred Value`)) +
+  geom_bar(stat="identity", fill = "#B19CD9", color="#AF64B5") +
+  ggtitle("No Spars. Rm") +
+  xlab("Model") + ylab("Prec.") +
+  ylim(0, 1)
+
+#___Recall_SCORES____________________________________________________________________________________________________________
+mod_bar_results_Recall_0 <- mod_results_byClass_0 %>%
+  ggplot(aes(model, Recall)) +
+  geom_bar(stat="identity", fill = "#efcc90", color="#d4a537") +
+  ggtitle("No Spars. Rm") +
+  xlab("Model") + ylab("Recall") +
+  ylim(0, 1)
+
+
+#________________________________________________________________________________________
+#########################################################################################
+#________________________________________________________________________________________
+#_______________________SPARSE DATA 1 0.99% SPARCITY REMOVED_____________________________
+#________________________________________________________________________________________
+#meta is used to store the observations from the original dataframe 
+#that may have been lost in the previous reduction steps.
+meta_1 <- tibble(id = as.numeric(dimnames(sparse_data_dtm_99)[[1]])) %>%
+  left_join(data_clean[!duplicated(data_clean$id), ], by = "id")
+
+#_______________________________________________________________________
+set.seed(1234)
+trainIndex_1 <- createDataPartition(meta_1$label, p = 0.8, list = FALSE, times = 1)
+
+#______________________________________________________________________
+data_df_train_1 <- sparse_data_dtm_99[trainIndex_1, ] %>% as.matrix() %>% as.data.frame()
+data_df_test_1 <- sparse_data_dtm_99[-trainIndex_1, ] %>% as.matrix() %>% as.data.frame()
+
+response_train_1 <- meta_1$label[trainIndex_1]
+
+#_______________________________________________________________________
+data_clean %>%
+  anti_join(meta_1, by = "id") %>%
+  head(25) %>%
+  pull(text)
+
+#_______________________________________________________________________
+trctrl <- trainControl(method = "repeatedcv",
+                       number = 3,
+                       repeats = 3,
+                       search = "grid")
+
+#__________________SVM_________________________________________________________________________________________________
+
+svm_mod_1 <- train(x = data_df_train_1,
+                 y = as.factor(response_train_1),
+                 method = "svmLinearWeights2",
+                 trControl = trctrl,
+                 tuneGrid = data.frame(cost = 1, 
+                                       Loss = 0, 
+                                       weight = 1))
+
+
+svm_pred_1 <- predict(svm_mod_1,
+                    newdata = data_df_test_1)
+
+svm_cm_1 <- confusionMatrix(svm_pred_1, meta_1[-trainIndex_1, ]$label, positive='TRUE')
+
+svm_cm_1
+
+#________________NAIVE-BAYES__________________________________________________________________________________________
+
+nb_mod_1 <- train(x = data_df_train_1,
+                y = as.factor(response_train_1),
+                method = "naive_bayes",
+                trControl = trctrl,
+                tuneGrid = data.frame(laplace = 0,
+                                      usekernel = FALSE,
+                                      adjust = FALSE))
+
+nb_pred_1 <- predict(nb_mod_1,
+                   newdata = data_df_test_1)
+
+nb_cm_1 <- confusionMatrix(nb_pred_1, meta_1[-trainIndex_1, ]$label, positive='TRUE')
+nb_cm_1
+
+#______________________RANDOM_FOREST_____________________________________________________________________________________
+rf_mod_1 <- train(x = data_df_train_1, 
+                y = as.factor(response_train_1), 
+                method = "ranger",
+                trControl = trctrl,
+                tuneGrid = data.frame(mtry = floor(sqrt(dim(data_df_train_1)[2])),
+                                      splitrule = "gini",
+                                      min.node.size = 1))
+
+rf_pred_1 <- predict(rf_mod_1,
+                   newdata = data_df_test_1)
+
+rf_cm_1 <- confusionMatrix(rf_pred_1, meta_1[-trainIndex_1, ]$label, positive='TRUE')
+rf_cm_1
+
+#___________________NNET____________________________________________________________________________________________________
+
+nnet_mod_1 <- train(x = data_df_train_1,
+                  y = as.factor(response_train_1),
+                  method = "nnet",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(size = 1,
+                                        decay = 0.01),
+                  MaxNWts = 5000)
+
+nnet_pred_1 <- predict(nnet_mod_1,
+                     newdata = data_df_test_1)
+
+nnet_cm_1 <- confusionMatrix(nnet_pred_1, meta_1[-trainIndex_1, ]$label, positive='TRUE')
+nnet_cm_1
+
+#__________________COMPARING_MODELS_ACCURACY_______________________________________________________________________________________
+
+mod_results_1 <- rbind(
+  svm_cm_1$overall, 
+  nb_cm_1$overall,
+  rf_cm_1$overall,
+  nnet_cm_1$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+mod_results_1 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_point() +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_1$AccuracyNull[1],
+             color = "red")
+
+mod_bar_results_1 <- mod_results_1 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_bar(stat="identity", fill = "#C1E4A5", color="#9EB953") +
+  xlab("Model") + ylab("Acc.") +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_1$AccuracyNull[1],
+             color = "red")
+
+#__________________COMPARING_MODELS_F-SCORES,_PRECISION,_AND_RECALL_________________________________________________________
+
+mod_results_byClass_1 <- rbind(
+  svm_cm_1$byClass, 
+  nb_cm_1$byClass,
+  rf_cm_1$byClass,
+  nnet_cm_1$byClass
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+#___F1_SCORES____________________________________________________________________________________________________________
+mod_bar_results_F1_1 <- mod_results_byClass_1 %>%
+  ggplot(aes(model, F1)) +
+  geom_bar(stat="identity", fill = "#abd7eb", color="#99badd") +
+  ggtitle("97% Sparcity") +
+  xlab("Model") + ylab("F1") +
+  #geom_text(aes(label=F1), vjust=1.6, color="white", size=3.5)+
+  ylim(0, 1)
+
+#___PRECISION_SCORES____________________________________________________________________________________________________________
+mod_bar_results_precision_1 <- mod_results_byClass_1 %>%
+  ggplot(aes(model, `Pos Pred Value`)) +
+  geom_bar(stat="identity", fill = "#B19CD9", color="#AF64B5") +
+  ggtitle("97% Sparcity") +
+  xlab("Model") + ylab("Prec.") +
+  ylim(0, 1)
+
+#___Recall_SCORES____________________________________________________________________________________________________________
+mod_bar_results_Recall_1 <- mod_results_byClass_1 %>%
+  ggplot(aes(model, Recall)) +
+  geom_bar(stat="identity", fill = "#efcc90", color="#d4a537") +
+  ggtitle("97% Sparcity") +
+  xlab("Model") + ylab("Recall") +
+  ylim(0, 1)
+
+
+
+
+#________________________________________________________________________________________
+#########################################################################################
+#________________________________________________________________________________________
+#_______________________SPARSE DATA 2 0.98% SPARCITY REMOVED_____________________________
+#________________________________________________________________________________________
+
+meta_2 <- tibble(id = as.numeric(dimnames(sparse_data_dtm_98)[[1]])) %>%
+  left_join(data_clean[!duplicated(data_clean$id), ], by = "id")
+
+#_______________________________________________________________________
+set.seed(1234)
+trainIndex_2 <- createDataPartition(meta_2$label, p = 0.8, list = FALSE, times = 1)
+
+#______________________________________________________________________
+data_df_train_2 <- sparse_data_dtm_98[trainIndex_2, ] %>% as.matrix() %>% as.data.frame()
+data_df_test_2 <- sparse_data_dtm_98[-trainIndex_2, ] %>% as.matrix() %>% as.data.frame()
+
+response_train_2 <- meta_2$label[trainIndex_2]
+
+#_______________________________________________________________________
+data_clean %>%
+  anti_join(meta_2, by = "id") %>%
+  head(25) %>%
+  pull(text)
+
+#_______________________________________________________________________
+trctrl <- trainControl(method = "none")
+
+#__________________SVM_________________________________________________________________________________________________
+
+svm_mod_2 <- train(x = data_df_train_2,
+                   y = as.factor(response_train_2),
+                   method = "svmLinearWeights2",
+                   trControl = trctrl,
+                   tuneGrid = data.frame(cost = 1, 
+                                         Loss = 0, 
+                                         weight = 1))
+
+svm_pred_2 <- predict(svm_mod_2,
+                      newdata = data_df_test_2)
+
+svm_cm_2 <- confusionMatrix(svm_pred_2, meta_2[-trainIndex_2, ]$label, positive='TRUE')
+
+svm_cm_2
+
+#________________NAIVE-BAYES__________________________________________________________________________________________
+
+nb_mod_2 <- train(x = data_df_train_2,
+                  y = as.factor(response_train_2),
+                  method = "naive_bayes",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(laplace = 0,
+                                        usekernel = FALSE,
+                                        adjust = FALSE))
+
+nb_pred_2 <- predict(nb_mod_2,
+                     newdata = data_df_test_2)
+
+nb_cm_2 <- confusionMatrix(nb_pred_2, meta_2[-trainIndex_2, ]$label, positive='TRUE')
+nb_cm_2
+
+#______________________RANDOM_FOREST_____________________________________________________________________________________
+rf_mod_2 <- train(x = data_df_train_2, 
+                  y = as.factor(response_train_2), 
+                  method = "ranger",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(mtry = floor(sqrt(dim(data_df_train_2)[2])),
+                                        splitrule = "gini",
+                                        min.node.size = 1))
+
+rf_pred_2 <- predict(rf_mod_2,
+                     newdata = data_df_test_2)
+
+rf_cm_2 <- confusionMatrix(rf_pred_2, meta_2[-trainIndex_2, ]$label, positive='TRUE')
+rf_cm_2
+
+#___________________NNET____________________________________________________________________________________________________
+
+nnet_mod_2 <- train(x = data_df_train_2,
+                    y = as.factor(response_train_2),
+                    method = "nnet",
+                    trControl = trctrl,
+                    tuneGrid = data.frame(size = 1,
+                                          decay = 5e-4),
+                    MaxNWts = 5000)
+
+nnet_pred_2 <- predict(nnet_mod_2,
+                       newdata = data_df_test_2)
+
+nnet_cm_2 <- confusionMatrix(nnet_pred_2, meta_2[-trainIndex_2, ]$label, positive='TRUE')
+nnet_cm_2
+
+#__________________COMPARING_MODELS_ACCURACY_______________________________________________________________________________________
+
+mod_results_2 <- rbind(
+  svm_cm_2$overall, 
+  nb_cm_2$overall,
+  rf_cm_2$overall,
+  nnet_cm_2$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+mod_results_2 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_point() +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_2$AccuracyNull[1],
+             color = "red")
+
+mod_bar_results_2 <- mod_results_2 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_bar(stat="identity", fill = "#C1E4A5", color="#9EB953") +
+  ggtitle("95% Sparcity") +
+  xlab("Model") + ylab("Acc.") +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_2$AccuracyNull[1],
+             color = "red")
+
+#__________________COMPARING_MODELS_F-SCORES,_PRECISION,_AND_RECALL_________________________________________________________
+
+mod_results_byClass_2 <- rbind(
+  svm_cm_2$byClass, 
+  nb_cm_2$byClass,
+  rf_cm_2$byClass,
+  nnet_cm_2$byClass
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+#___F1_SCORES____________________________________________________________________________________________________________
+mod_bar_results_F1_2 <- mod_results_byClass_2 %>%
+  ggplot(aes(model, F1)) +
+  geom_bar(stat="identity", fill = "#abd7eb", color="#99badd") +
+  ggtitle("95% Sparcity") +
+  xlab("Model") + ylab("F1") +
+  ylim(0, 1)
+
+#___PRECISION_SCORES____________________________________________________________________________________________________________
+mod_bar_results_precision_2 <- mod_results_byClass_2 %>%
+  ggplot(aes(model, `Pos Pred Value`)) +
+  geom_bar(stat="identity", fill = "#B19CD9", color="#AF64B5") +
+  ggtitle("95% Sparcity") +
+  xlab("Model") + ylab("Prec.") +
+  ylim(0, 1)
+
+#___Recall_SCORES____________________________________________________________________________________________________________
+mod_bar_results_Recall_2 <- mod_results_byClass_2 %>%
+  ggplot(aes(model, Recall)) +
+  geom_bar(stat="identity", fill = "#efcc90", color="#d4a537") +
+  ggtitle("95% Sparcity") +
+  xlab("Model") + ylab("Recall") +
+  ylim(0, 1)
+
+
+#________________________________________________________________________________________
+#########################################################################################
+#________________________________________________________________________________________
+#_______________________SPARSE DATA 3 0.97% SPARCITY REMOVED_____________________________
+#________________________________________________________________________________________
+
+meta_3 <- tibble(id = as.numeric(dimnames(sparse_data_dtm_97)[[1]])) %>%
+  left_join(data_clean[!duplicated(data_clean$id), ], by = "id")
+
+#_______________________________________________________________________
+set.seed(1234)
+trainIndex_3 <- createDataPartition(meta_3$label, p = 0.8, list = FALSE, times = 1)
+
+#______________________________________________________________________
+data_df_train_3 <- sparse_data_dtm_97[trainIndex_3, ] %>% as.matrix() %>% as.data.frame()
+data_df_test_3 <- sparse_data_dtm_97[-trainIndex_3, ] %>% as.matrix() %>% as.data.frame()
+
+response_train_3 <- meta_3$label[trainIndex_3]
+
+#_______________________________________________________________________
+data_clean %>%
+  anti_join(meta_3, by = "id") %>%
+  head(25) %>%
+  pull(text)
+
+#_______________________________________________________________________
+trctrl <- trainControl(method = "none")
+
+#__________________SVM_________________________________________________________________________________________________
+
+svm_mod_3 <- train(x = data_df_train_3,
+                   y = as.factor(response_train_3),
+                   method = "svmLinearWeights2",
+                   trControl = trctrl,
+                   tuneGrid = data.frame(cost = 1, 
+                                         Loss = 0, 
+                                         weight = 1))
+
+svm_pred_3 <- predict(svm_mod_3,
+                      newdata = data_df_test_3)
+
+svm_cm_3 <- confusionMatrix(svm_pred_3, meta_3[-trainIndex_3, ]$label, positive='TRUE')
+
+svm_cm_3
+
+#________________NAIVE-BAYES__________________________________________________________________________________________
+
+nb_mod_3 <- train(x = data_df_train_3,
+                  y = as.factor(response_train_3),
+                  method = "naive_bayes",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(laplace = 0,
+                                        usekernel = FALSE,
+                                        adjust = FALSE))
+
+nb_pred_3 <- predict(nb_mod_3,
+                     newdata = data_df_test_3)
+
+nb_cm_3 <- confusionMatrix(nb_pred_3, meta_3[-trainIndex_3, ]$label, positive='TRUE')
+nb_cm_3
+
+#______________________RANDOM_FOREST_____________________________________________________________________________________
+rf_mod_3 <- train(x = data_df_train_3, 
+                  y = as.factor(response_train_3), 
+                  method = "ranger",
+                  trControl = trctrl,
+                  tuneGrid = data.frame(mtry = floor(sqrt(dim(data_df_train_3)[2])),
+                                        splitrule = "gini",
+                                        min.node.size = 1))
+
+rf_pred_3 <- predict(rf_mod_3,
+                     newdata = data_df_test_3)
+
+rf_cm_3 <- confusionMatrix(rf_pred_3, meta_3[-trainIndex_3, ]$label, positive='TRUE')
+rf_cm_3
+
+#___________________NNET____________________________________________________________________________________________________
+
+nnet_mod_3 <- train(x = data_df_train_3,
+                    y = as.factor(response_train_3),
+                    method = "nnet",
+                    trControl = trctrl,
+                    tuneGrid = data.frame(size = 1,
+                                          decay = 5e-4),
+                    MaxNWts = 5000)
+
+nnet_pred_3 <- predict(nnet_mod_3,
+                       newdata = data_df_test_3)
+
+nnet_cm_3 <- confusionMatrix(nnet_pred_3, meta_3[-trainIndex_3, ]$label, positive='TRUE')
+nnet_cm_3
+
+#__________________COMPARING_MODELS_ACCURACY_______________________________________________________________________________________
+
+mod_results_3 <- rbind(
+  svm_cm_3$overall, 
+  nb_cm_3$overall,
+  rf_cm_3$overall,
+  nnet_cm_3$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+mod_results_3 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_point() +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_3$AccuracyNull[1],
+             color = "red")
+
+mod_bar_results_3 <- mod_results_3 %>%
+  ggplot(aes(model, Accuracy)) +
+  geom_bar(stat="identity", fill = "#C1E4A5", color="#9EB953") +
+  ggtitle("94% Sparcity") +
+  xlab("Model") + ylab("Acc.") +
+  ylim(0, 1) +
+  geom_hline(yintercept = mod_results_3$AccuracyNull[1],
+             color = "red")
+
+#__________________COMPARING_MODELS_F-SCORES,_PRECISION,_AND_RECALL_________________________________________________________
+
+mod_results_byClass_3 <- rbind(
+  svm_cm_3$byClass, 
+  nb_cm_3$byClass,
+  rf_cm_3$byClass,
+  nnet_cm_3$byClass
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+
+#___F1_SCORES____________________________________________________________________________________________________________
+mod_bar_results_F1_3 <- mod_results_byClass_3 %>%
+  ggplot(aes(model, F1)) +
+  geom_bar(stat="identity", fill = "#abd7eb", color="#99badd") +
+  ggtitle("94% Sparcity") +
+  xlab("Model") + ylab("F1") +
+  ylim(0, 1)
+
+#___PRECISION_SCORES____________________________________________________________________________________________________________
+mod_bar_results_precision_3 <- mod_results_byClass_3 %>%
+  ggplot(aes(model, `Pos Pred Value`)) +
+  geom_bar(stat="identity", fill = "#B19CD9", color="#AF64B5") +
+  ggtitle("94% Sparcity") +
+  xlab("Model") + ylab("Prec.") +
+  ylim(0, 1)
+
+#___Recall_SCORES____________________________________________________________________________________________________________
+mod_bar_results_Recall_3 <- mod_results_byClass_3 %>%
+  ggplot(aes(model, Recall)) +
+  geom_bar(stat="identity", fill = "#efcc90", color="#d4a537") +
+  ggtitle("94% Sparcity") +
+  xlab("Model") + ylab("Recall") +
+  ylim(0, 1)
+
+
+
+#_____________________________________________________________________________________________________________________________
+##############################################################################################################################
+#So I recommend separate grouped bar charts for each of the four metrics (precision, recall, accuracy, f1).
+#Each group would be the different ML algorithms. Within each group would be varying sparsity (no sparsity, 
+#sparsity=0.99, sparsity=0.95, sparsity=0.9).
+
+#You can also create a separate bar chart/scatter plot of the data size with varying sparsity: 
+#x-axis = sparsity, y=number of words/number of columns in the Document-Term matrix).
+
+#You can also think what other parameters, in addition to sparsity, can be varied.
+
+#It will also be interesting to plot the results as a ROC curve:
+#https://en.wikipedia.org/wiki/Receiver_operating_characteristic
+#In this case, each sparsity will generate a point on a scatterplot with 
+#y = recall/sensitivity and x=specificity.
+
+#____________________________________________________________________________________
+mod_results_byClass_0$sparsity <- "No Spars. Rm."
+mod_results_byClass_1$sparsity <- "97%"
+mod_results_byClass_2$sparsity <-"95%"
+mod_results_byClass_3$sparsity <-"94%"
+sparse_data <- rbind(mod_results_byClass_0, mod_results_byClass_1, mod_results_byClass_2, mod_results_byClass_3)
+
+#____________CREATE_SPARSITY_DS_TO_MEASURE_ACCURACY_________________________________________
+#Plot sparcity and model accuracy scores
+mod_results_0 <- rbind(
+  svm_cm_0$overall, 
+  nb_cm_0$overall,
+  rf_cm_0$overall,
+  nnet_cm_0$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+mod_results_0$sparsity <- "No Spars. Rm."
+
+mod_results_1 <- rbind(
+  svm_cm_1$overall, 
+  nb_cm_1$overall,
+  rf_cm_1$overall,
+  nnet_cm_1$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+mod_results_1$sparsity <- "97%"
+
+
+mod_results_2 <- rbind(
+  svm_cm_2$overall, 
+  nb_cm_2$overall,
+  rf_cm_2$overall,
+  nnet_cm_2$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+mod_results_2$sparsity <- "95%"
+
+mod_results_3 <- rbind(
+  svm_cm_3$overall, 
+  nb_cm_3$overall,
+  rf_cm_3$overall,
+  nnet_cm_3$overall
+) %>%
+  as.data.frame() %>%
+  mutate(model = c("SVM", "NB", "RF", "NN"))
+mod_results_3$sparsity <- "94%"
+
+mod_results_sparse <- rbind(mod_results_0, mod_results_1, mod_results_2, mod_results_3)
+
+
+#__________________________________________________________________________________________
+#Plot accuracy and model scores with sparsity dataset
+ggplot()+ geom_col(data = mod_results_sparse, aes(x=model, y=Accuracy, fill=sparsity),
+                   position="dodge") + scale_fill_manual(values=c("#efcc90","#abd7eb", "#C1E4A5", "#B19CD9")) + ylim(0, 1) + geom_hline(yintercept = mod_results$AccuracyNull[1],color = "red") +
+  ylab("Acc.")
+
+
+#Plot sparcity and model F1 scores
+ggplot()+ geom_col(data = sparse_data, aes(x=model, y=F1, fill=sparsity),
+          position="dodge") + scale_fill_manual(values=c("#efcc90", "#abd7eb", "#C1E4A5", "#B19CD9")) +
+  ylab("F1") +
+  ylim(0, 1)
+
+#Plot sparcity and model Recall scores
+ggplot()+ geom_col(data = sparse_data, aes(x=model, y=Recall, fill=sparsity),
+                   position="dodge") + scale_fill_manual(values=c("#efcc90","#abd7eb", "#C1E4A5", "#B19CD9")) +
+  ylab("Rec.") +
+  ylim(0, 1)
+
+#Plot sparcity and model Precision scores
+ggplot()+ geom_col(data = sparse_data, aes(x=model, y=`Pos Pred Value`, fill=sparsity),
+                   position="dodge") + scale_fill_manual(values=c("#efcc90","#abd7eb", "#C1E4A5", "#B19CD9")) +
+  ylab("Prec.") +
+  ylim(0, 1)
+
+#______________________________________________________________________________________________
+#Plot of word count in various sparse dtm's
+word_count_dtm_0 <- 1
+word_count_dtm_1 <- 1
+word_count_dtm_2 <- 1
+word_count_dtm_3 <- 1
+
+word_count_dtm_0$terms <- data_dtm$ncol
+word_count_dtm_1$terms <- sparse_data_dtm_99$ncol
+word_count_dtm_2$terms <- sparse_data_dtm_98$ncol
+word_count_dtm_3$terms <- sparse_data_dtm_97$ncol
+
+word_count_dtm_0 <- as.data.frame(word_count_dtm_0)
+word_count_dtm_1 <- as.data.frame(word_count_dtm_1)
+word_count_dtm_2 <- as.data.frame(word_count_dtm_2)
+word_count_dtm_3 <- as.data.frame(word_count_dtm_3)
+
+word_count_dtm_0$sparsity <- "No Spars. Rm."
+word_count_dtm_1$sparsity <- "97%"
+word_count_dtm_2$sparsity <- "95%"
+word_count_dtm_3$sparsity <- "94%"
+
+word_count_dtm_0 <- word_count_dtm_0[, 2:3]
+word_count_dtm_1 <- word_count_dtm_1[, 2:3]
+word_count_dtm_2 <- word_count_dtm_2[, 2:3]
+word_count_dtm_3 <- word_count_dtm_3[, 2:3]
+
+word_count_dtm <- rbind(word_count_dtm_0, word_count_dtm_1, word_count_dtm_2, word_count_dtm_3)
+
+ggplot()+ geom_col(data = word_count_dtm, aes(x=sparsity, y=terms, fill=sparsity),
+                   position="dodge") + scale_fill_manual(values=c("#efcc90", "#abd7eb", "#C1E4A5", "#B19CD9")) +
+  ylab("Terms") +
+  ggtitle("T.T by Spars.")
+
+#Plot ROC curve ___________________________________________________________________________________
+#In this case, each sparsity will generate a point on a scatterplot with 
+#y= recall/sensitivity and x=specificity
+
+
+
+#4 curves, 4 sparcity values
+#1 for each classifier
+#Each curve will have points for its own sparsity
+
+
+#Table of model results
+kable(mod_results) %>%
+  kable_styling(fixed_thead = T)
+
+#Table of model results F1, precision, recall, etc
+kable(mod_results_byClass) %>%
+  kable_styling(fixed_thead = T)
+
+#Table of results F1,.... By sparsity
+kable(mod_results_sparse) %>%
+  kable_styling(fixed_thead = T)
+
+##Most frequent words in data_dtm
+#Top 100 most frequent words
+#Re-read final pdf
+
+#Save data_sparse as R object
+save(sparse_data, file = "C:\\Users\\Angel\\datasets\\stuff.RData")
+
+#Graphs most pupular words
+findMostFreqTerms(sparse_data_dtm_97)
+findFreqTerms(sparse_data_dtm_97)
+
+dataset_graphs<-dataset_words %>% arrange(desc(tf-idf)) %>% mutate(word=factor(word, levels=rev(unique(word)))) %>% group_by(dataset) %>% 
+  top_n(15, tf_idf) %>% 
+  ungroup() %>% 
+  ggplot(aes(word, tf_idf, fill=dataset, width=0.75)) +
+  geom_col(show.legend = FALSE) +
+  labs(x=NULL, y="tf-idf") +
+  facet_wrap(~dataset, ncol=2, scales="free") +
+  coord_flip() +
+  scale_x_reordered()
